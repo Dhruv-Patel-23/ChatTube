@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+langchain
+langchain-community
+langchain-groq
+langchain-chroma
+sentence-transformers
+youtube-transcript-api
+tiktoken
