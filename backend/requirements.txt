@@ -8,3 +8,11 @@ langchain-chroma
 sentence-transformers
 youtube-transcript-api
 tiktoken
+yt-dlp
+pydub
+groq
+langchain-text-splitters
+langgraph
+huggingface-hub
+requests
+pydantic

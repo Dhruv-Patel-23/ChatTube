@@ -31,7 +31,8 @@ from groq import Groq
 import uuid
 from pydub import AudioSegment
 import math
-
+import subprocess
+import glob
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 load_dotenv()
@@ -201,6 +202,7 @@ def get_vectorstore(video_id: str):
 #         print(f"❌ TRANSCRIPTION FAILED: {str(e)}")
 #         raise e
 # --- HELPER FOR PARALLEL PROCESSING ---
+# --- HELPER FOR PARALLEL PROCESSING ---
 def transcribe_chunk(client, chunk_filename):
     """Helper function to transcribe a single chunk."""
     try:
@@ -218,27 +220,39 @@ def transcribe_chunk(client, chunk_filename):
         print(f"❌ Error transcribing {chunk_filename}: {e}")
         return ""
     finally:
-        # Clean up chunk immediately after processing
         if os.path.exists(chunk_filename): os.remove(chunk_filename)
 
-# --- UPDATED AUDIO DOWNLOADER ---
+# --- OPTIMIZED DOWNLOADER (FFMPEG SPLIT) ---
+# --- OPTIMIZED DOWNLOADER (FFMPEG SPLIT + STABILITY FIX) ---
 def download_audio_and_transcribe(video_url: str):
     print("⚠️ No subtitles found. Falling back to Audio Transcription...")
     groq_client = Groq(api_key=DEFAULT_GROQ_KEY)
     
-    # 1. Use UUID for Safe Parallel User Sessions
     session_id = str(uuid.uuid4())
     print(f"   🆔 Session ID: {session_id}")
 
     base_filename = f"temp_audio_{session_id}"
     audio_filename = f"{base_filename}.mp3"
     
+    # ✅ UPDATED ROBUST OPTIONS
     ydl_opts = {
         'format': 'bestaudio/best',
-        'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '32'}],
         'outtmpl': f"{base_filename}.%(ext)s",
+        'noplaylist': True,  # <--- CRITICAL FIX: Only download the specific video
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '32'
+        }],
+        # ... (keep your stability options like quiet, timeout, source_address, user_agent) ...
         'quiet': True,
-        'js_runtimes': {'node': {}} 
+        'no_warnings': True,
+        'nocheckcertificate': True,
+        'socket_timeout': 60,
+        'retries': 10,
+        'fragment_retries': 10,
+        'source_address': '0.0.0.0',
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     }
     
     try:
@@ -248,6 +262,10 @@ def download_audio_and_transcribe(video_url: str):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
         
+        # Check if file exists (sometimes yt-dlp fails silently or creates .part files)
+        if not os.path.exists(audio_filename):
+            raise FileNotFoundError(f"Download failed, file {audio_filename} not created.")
+
         file_size_mb = os.path.getsize(audio_filename) / (1024 * 1024)
         print(f"   Audio File Size: {file_size_mb:.2f} MB")
 
@@ -266,32 +284,31 @@ def download_audio_and_transcribe(video_url: str):
             full_transcript = transcription.text
             
         else:
-            # Large file: Parallel Processing!
-            print("   ⚠️ File too large. Splitting into chunks...")
-            audio = AudioSegment.from_mp3(audio_filename)
-            chunk_length_ms = 10 * 60 * 1000 
-            chunks = [audio[i:i + chunk_length_ms] for i in range(0, len(audio), chunk_length_ms)]
+            # Large file: Use FFmpeg Stream Splitting (Low Memory)
+            print("   ⚠️ File too large. Splitting using FFmpeg (Stream Mode)...")
             
-            chunk_files = []
+            chunk_pattern = f"temp_chunk_{session_id}_%03d.mp3"
             
-            # Export all chunks first
-            print(f"   Exporting {len(chunks)} chunks for parallel processing...")
-            for i, chunk in enumerate(chunks):
-                chunk_name = f"temp_chunk_{session_id}_{i}.mp3" 
-                chunk.export(chunk_name, format="mp3", bitrate="32k")
-                chunk_files.append(chunk_name)
+            command = [
+                "ffmpeg", "-i", audio_filename, 
+                "-f", "segment", 
+                "-segment_time", "600", 
+                "-c", "copy", 
+                "-reset_timestamps", "1",
+                chunk_pattern
+            ]
             
+            subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            chunk_files = sorted(glob.glob(f"temp_chunk_{session_id}_*.mp3"))
+            print(f"   ✅ Split into {len(chunk_files)} chunks instantly.")
+
             # --- PARALLEL EXECUTION START --- 
-            # Process up to 3 chunks at the same time
             print("   🚀 Starting Parallel Transcription...")
             with ThreadPoolExecutor(max_workers=3) as executor:
-                # Submit all tasks
                 futures = [executor.submit(transcribe_chunk, groq_client, f) for f in chunk_files]
-                
-                # Wait for results in order
                 results = [f.result() for f in futures]
             
-            # Combine results
             full_transcript = " ".join(results)
             print("   ✅ Parallel Transcription Complete.")
             # --- PARALLEL EXECUTION END ---
@@ -301,12 +318,12 @@ def download_audio_and_transcribe(video_url: str):
         
     except Exception as e:
         if os.path.exists(audio_filename): os.remove(audio_filename)
-        # Cleanup any remaining chunks
-        for f in os.listdir():
-            if f.startswith(f"temp_chunk_{session_id}"):
-                os.remove(f)
+        for f in glob.glob(f"temp_chunk_{session_id}_*.mp3"):
+            try: os.remove(f)
+            except: pass
         print(f"❌ TRANSCRIPTION FAILED: {str(e)}")
         raise e
+
 
 # --- DATA MODELS ---
 class VideoRequest(BaseModel):

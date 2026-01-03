@@ -7,6 +7,19 @@ import "./style.css"
 type Role = "user" | "assistant"
 interface Message { role: Role; content: string }
 
+// --- HELPER: CLEAN URL ---
+// Removes playlist/index params so we treat the video consistently
+const getCleanVideoUrl = (url: string) => {
+    try {
+        const urlObj = new URL(url);
+        const videoId = urlObj.searchParams.get("v");
+        // Returns a standard URL: https://www.youtube.com/watch?v=ID
+        return videoId ? `https://www.youtube.com/watch?v=${videoId}` : null;
+    } catch (e) {
+        return null;
+    }
+}
+
 export default function SidePanel() {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState("")
@@ -21,44 +34,46 @@ export default function SidePanel() {
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   
-  // 1. ADD THIS REF
-  // This tracks the "real" current video, even inside async functions
+  // Tracks the "real" current video to prevent async race conditions
   const activeUrlRef = useRef("") 
 
   // --- LOGIC: Load Chat & Settings ---
-  const loadChatForUrl = (url: string) => {
-    // Update the Ref immediately so any running async tasks know we switched context
-    activeUrlRef.current = url; 
+  const loadChatForUrl = (rawUrl: string) => {
+    // 1. Clean the URL (remove playlist params)
+    const cleanUrl = getCleanVideoUrl(rawUrl);
+    
+    // Update the Ref immediately
+    activeUrlRef.current = cleanUrl || ""; 
 
-    // 1. Invalid or Non-YouTube URL? Reset everything.
-    if (!url || !url.includes("youtube.com/watch")) {
+    // 2. Invalid URL? Reset everything.
+    if (!cleanUrl) {
         setVideoProcessed(false)
         setCurrentVideoUrl("")
         setMessages([])
-        setInitLoading(false) // <--- CRITICAL RESET: Stop spinner immediately
-        setLoading(false)     // <--- CRITICAL RESET
+        setInitLoading(false) 
+        setLoading(false)     
         return
     }
 
-    // 2. Same video? Do nothing (prevents flickering)
-    if (url === currentVideoUrl) return;
+    // 3. Same video? Do nothing.
+    if (cleanUrl === currentVideoUrl) return;
 
-    // 3. New Video Detected: Set URL and Reset UI
-    setCurrentVideoUrl(url)
+    // 4. New Video Detected: Set URL and Reset UI
+    setCurrentVideoUrl(cleanUrl)
     setMessages([]) 
     setVideoProcessed(false)
     
-    // 4. CRITICAL: FORCE RESET LOADING STATES
-    // This ensures if you switch tabs while one is loading, the new tab starts fresh
+    // Force reset loading states for the new tab
     setInitLoading(false) 
     setLoading(false)
 
-    chrome.storage.local.get([url], (result) => {
-        // Safety check: Ensure we are still looking at the requested URL
-        if (activeUrlRef.current !== url) return; 
+    // 5. Check Local Storage
+    chrome.storage.local.get([cleanUrl], (result) => {
+        // Safety check: Are we still on the same video?
+        if (activeUrlRef.current !== cleanUrl) return; 
 
-        if (result[url] && result[url].length > 0) {
-            setMessages(result[url])
+        if (result[cleanUrl] && result[cleanUrl].length > 0) {
+            setMessages(result[cleanUrl])
             setVideoProcessed(true) 
         } else {
             setMessages([])
@@ -69,18 +84,18 @@ export default function SidePanel() {
 
   // --- MAIN LISTENER EFFECT ---
   useEffect(() => {
-    // 1. Load saved user settings
+    // Load Settings
     chrome.storage.local.get(["userApiKey", "userProvider"], (result) => {
         if(result.userApiKey) setApiKey(result.userApiKey)
         if(result.userProvider) setProvider(result.userProvider)
     })
     
-    // 2. Initial Check
+    // Initial Check
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
         if (tabs[0]?.url) loadChatForUrl(tabs[0].url)
     })
     
-    // 3. Listener: Handle messages from background script
+    // Listener: Handle messages from background script
     const handleRuntimeMessage = (message: any) => {
         if (message.type === "TAB_CHANGED" || message.type === "URL_UPDATED") {
             console.log("🔄 Context Switch:", message.url)
@@ -88,26 +103,24 @@ export default function SidePanel() {
         }
     }
 
-    // 4. Fallback Listener: Direct Tab Switching
+    // Fallback Listener: Direct Tab Switching
     const handleTabChange = (activeInfo: any) => {
         chrome.tabs.get(activeInfo.tabId, (tab) => {
             if (tab.url) loadChatForUrl(tab.url)
         })
     }
 
-    // 5. Fallback Listener: Navigation within same tab
+    // Fallback Listener: URL Update (Navigation)
     const handleUrlUpdate = (tabId: number, changeInfo: any, tab: chrome.tabs.Tab) => {
         if (changeInfo.status === 'complete' && tab.active && tab.url) {
             loadChatForUrl(tab.url)
         }
     }
 
-    // Register Listeners
     chrome.runtime.onMessage.addListener(handleRuntimeMessage)
     chrome.tabs.onActivated.addListener(handleTabChange)
     chrome.tabs.onUpdated.addListener(handleUrlUpdate)
 
-    // Cleanup Listeners on Unmount
     return () => {
         chrome.runtime.onMessage.removeListener(handleRuntimeMessage)
         chrome.tabs.onActivated.removeListener(handleTabChange)
@@ -118,7 +131,7 @@ export default function SidePanel() {
   // --- AUTO-SCROLL ---
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }) }, [messages, loading])
   
-  // --- SAVE HISTORY TO STORAGE ---
+  // --- SAVE HISTORY ---
   useEffect(() => { 
       if (currentVideoUrl && messages.length > 0) {
           chrome.storage.local.set({ [currentVideoUrl]: messages }) 
@@ -142,11 +155,11 @@ export default function SidePanel() {
   const initChat = async () => {
     if (!currentVideoUrl) return
     
-    // Capture the URL *at the moment the button was clicked*
     const targetUrl = currentVideoUrl; 
-    
     setInitLoading(true) 
+    
     try {
+        // NOTE: Replace with your Render URL if deployed
         const res = await fetch("http://127.0.0.1:8000/process-video", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -154,20 +167,17 @@ export default function SidePanel() {
         })
         if (!res.ok) throw new Error("Backend Error")
         
-        // 3. SAFETY CHECK:
-        // Before updating UI, check: "Is the user STILL on this video?"
+        // Safety Check: Are we still on the same video?
         if (activeUrlRef.current === targetUrl) {
             setVideoProcessed(true)
             setMessages([{ role: "assistant", content: "Ready! I've watched the video. Ask me anything!" }])
         } else {
-            console.log("Background process finished, but user switched tabs. Ignoring UI update.")
+            console.log("Ignored completion: User switched tabs.")
         }
 
     } catch (e) { 
         console.error(e) 
     } finally { 
-        // Only turn off loading if we are still on that tab.
-        // If we switched tabs, we don't want to mess with the new tab's loading state.
         if (activeUrlRef.current === targetUrl) {
             setInitLoading(false) 
         }
