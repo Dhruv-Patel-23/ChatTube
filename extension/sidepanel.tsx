@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react"
 import { Send, Settings, Trash2, Youtube, Sparkles, Loader2, PlayCircle, ArrowLeft } from "lucide-react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
-import "./style.css" // Ensure this imports tailwind directives
+import "./style.css" 
 
 type Role = "user" | "assistant"
 interface Message { role: Role; content: string }
@@ -10,8 +10,8 @@ interface Message { role: Role; content: string }
 export default function SidePanel() {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState("")
-  const [loading, setLoading] = useState(false) // For sending messages
-  const [initLoading, setInitLoading] = useState(false) // For "Start Chatting"
+  const [loading, setLoading] = useState(false) 
+  const [initLoading, setInitLoading] = useState(false) 
   const [videoProcessed, setVideoProcessed] = useState(false)
   const [currentVideoUrl, setCurrentVideoUrl] = useState("")
   const [showSettings, setShowSettings] = useState(false)
@@ -20,16 +20,43 @@ export default function SidePanel() {
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  
+  // 1. ADD THIS REF
+  // This tracks the "real" current video, even inside async functions
+  const activeUrlRef = useRef("") 
 
   // --- LOGIC: Load Chat & Settings ---
   const loadChatForUrl = (url: string) => {
+    // Update the Ref immediately so any running async tasks know we switched context
+    activeUrlRef.current = url; 
+
+    // 1. Invalid or Non-YouTube URL? Reset everything.
     if (!url || !url.includes("youtube.com/watch")) {
         setVideoProcessed(false)
         setCurrentVideoUrl("")
+        setMessages([])
+        setInitLoading(false) // <--- CRITICAL RESET: Stop spinner immediately
+        setLoading(false)     // <--- CRITICAL RESET
         return
     }
+
+    // 2. Same video? Do nothing (prevents flickering)
+    if (url === currentVideoUrl) return;
+
+    // 3. New Video Detected: Set URL and Reset UI
     setCurrentVideoUrl(url)
+    setMessages([]) 
+    setVideoProcessed(false)
+    
+    // 4. CRITICAL: FORCE RESET LOADING STATES
+    // This ensures if you switch tabs while one is loading, the new tab starts fresh
+    setInitLoading(false) 
+    setLoading(false)
+
     chrome.storage.local.get([url], (result) => {
+        // Safety check: Ensure we are still looking at the requested URL
+        if (activeUrlRef.current !== url) return; 
+
         if (result[url] && result[url].length > 0) {
             setMessages(result[url])
             setVideoProcessed(true) 
@@ -40,47 +67,65 @@ export default function SidePanel() {
     })
   }
 
+  // --- MAIN LISTENER EFFECT ---
   useEffect(() => {
+    // 1. Load saved user settings
     chrome.storage.local.get(["userApiKey", "userProvider"], (result) => {
         if(result.userApiKey) setApiKey(result.userApiKey)
         if(result.userProvider) setProvider(result.userProvider)
     })
     
-    // Listeners for tab switches
+    // 2. Initial Check
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
         if (tabs[0]?.url) loadChatForUrl(tabs[0].url)
     })
     
+    // 3. Listener: Handle messages from background script
+    const handleRuntimeMessage = (message: any) => {
+        if (message.type === "TAB_CHANGED" || message.type === "URL_UPDATED") {
+            console.log("🔄 Context Switch:", message.url)
+            loadChatForUrl(message.url)
+        }
+    }
+
+    // 4. Fallback Listener: Direct Tab Switching
     const handleTabChange = (activeInfo: any) => {
         chrome.tabs.get(activeInfo.tabId, (tab) => {
             if (tab.url) loadChatForUrl(tab.url)
         })
     }
+
+    // 5. Fallback Listener: Navigation within same tab
     const handleUrlUpdate = (tabId: number, changeInfo: any, tab: chrome.tabs.Tab) => {
         if (changeInfo.status === 'complete' && tab.active && tab.url) {
             loadChatForUrl(tab.url)
         }
     }
 
+    // Register Listeners
+    chrome.runtime.onMessage.addListener(handleRuntimeMessage)
     chrome.tabs.onActivated.addListener(handleTabChange)
     chrome.tabs.onUpdated.addListener(handleUrlUpdate)
+
+    // Cleanup Listeners on Unmount
     return () => {
+        chrome.runtime.onMessage.removeListener(handleRuntimeMessage)
         chrome.tabs.onActivated.removeListener(handleTabChange)
         chrome.tabs.onUpdated.removeListener(handleUrlUpdate)
     }
-  }, [])
+  }, [currentVideoUrl]) 
 
-  // Auto-scroll
+  // --- AUTO-SCROLL ---
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }) }, [messages, loading])
   
-  // Save History
+  // --- SAVE HISTORY TO STORAGE ---
   useEffect(() => { 
       if (currentVideoUrl && messages.length > 0) {
           chrome.storage.local.set({ [currentVideoUrl]: messages }) 
       }
   }, [messages, currentVideoUrl])
 
-  // Auto-resize Input
+  // --- AUTO-RESIZE INPUT ---
   useEffect(() => {
     if (textareaRef.current) {
         textareaRef.current.style.height = "auto"
@@ -96,18 +141,37 @@ export default function SidePanel() {
   // --- API: Initialize Chat ---
   const initChat = async () => {
     if (!currentVideoUrl) return
-    setInitLoading(true) // Start "Buffering" state
+    
+    // Capture the URL *at the moment the button was clicked*
+    const targetUrl = currentVideoUrl; 
+    
+    setInitLoading(true) 
     try {
         const res = await fetch("http://127.0.0.1:8000/process-video", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ video_url: currentVideoUrl }),
+            body: JSON.stringify({ video_url: targetUrl }),
         })
         if (!res.ok) throw new Error("Backend Error")
-        setVideoProcessed(true)
-        setMessages([{ role: "assistant", content: "Ready! I've watched the video. Ask me anything!" }])
-    } catch (e) { console.error(e) } 
-    finally { setInitLoading(false) }
+        
+        // 3. SAFETY CHECK:
+        // Before updating UI, check: "Is the user STILL on this video?"
+        if (activeUrlRef.current === targetUrl) {
+            setVideoProcessed(true)
+            setMessages([{ role: "assistant", content: "Ready! I've watched the video. Ask me anything!" }])
+        } else {
+            console.log("Background process finished, but user switched tabs. Ignoring UI update.")
+        }
+
+    } catch (e) { 
+        console.error(e) 
+    } finally { 
+        // Only turn off loading if we are still on that tab.
+        // If we switched tabs, we don't want to mess with the new tab's loading state.
+        if (activeUrlRef.current === targetUrl) {
+            setInitLoading(false) 
+        }
+    }
   }
 
   // --- API: Send Message ---
@@ -201,18 +265,14 @@ export default function SidePanel() {
   return (
     <div className="flex flex-col h-screen bg-slate-50 text-slate-900 font-sans">
       
-      {/* 1. HEADER - LOGO LEFT, BUTTONS RIGHT */}
+      {/* 1. HEADER */}
       <div className="px-4 py-3 bg-white/80 backdrop-blur-md border-b border-slate-200 flex items-center justify-between sticky top-0 z-20">
-        
-        {/* Logo Section */}
         <div className="flex items-center gap-2">
             <div className="p-1.5 bg-red-50 rounded-lg">
                 <Youtube size={20} className="text-red-600 fill-current" />
             </div>
             <h1 className="font-bold text-slate-800 text-sm tracking-tight">ChatTube</h1>
         </div>
-
-        {/* Buttons Section */}
         <div className="flex gap-1">
             <button 
                 onClick={() => setShowSettings(true)} 
@@ -274,24 +334,15 @@ export default function SidePanel() {
         ) : (
             <>
                 {messages.map((msg, index) => (
-                    // ALIGNMENT LOGIC: Flex-row-reverse for USER (Right), Flex-row for AI (Left)
                     <div key={index} className={`flex w-full ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
                         <div className={`flex gap-3 max-w-[85%] ${msg.role === "user" ? "flex-row-reverse" : "flex-row"}`}>
-                            
-                            {/* Avatar */}
                             <div className={`w-8 h-8 rounded-full flex-shrink-0 flex items-center justify-center text-xs font-bold shadow-sm ${
-                                msg.role === "user" 
-                                ? "bg-indigo-600 text-white" 
-                                : "bg-white border border-slate-200 text-indigo-600"
+                                msg.role === "user" ? "bg-indigo-600 text-white" : "bg-white border border-slate-200 text-indigo-600"
                             }`}>
                                 {msg.role === "user" ? "You" : "AI"}
                             </div>
-
-                            {/* Message Bubble */}
                             <div className={`p-3.5 rounded-2xl text-sm leading-relaxed shadow-sm ${
-                                msg.role === "user" 
-                                ? "bg-indigo-600 text-white rounded-tr-sm" 
-                                : "bg-white border border-slate-100 text-slate-700 rounded-tl-sm"
+                                msg.role === "user" ? "bg-indigo-600 text-white rounded-tr-sm" : "bg-white border border-slate-100 text-slate-700 rounded-tl-sm"
                             }`}>
                                  {msg.role === "assistant" ? (
                                     <ReactMarkdown 

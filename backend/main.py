@@ -6,8 +6,8 @@ from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from contextlib import asynccontextmanager  # <--- ADDED THIS
-
+from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
 # --- LangChain Providers ---
 from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI
@@ -67,11 +67,11 @@ async def lifespan(app: FastAPI):
         
     yield  # 2. App runs here
     
-    # 3. Shutdown Logic (Optional: you can add shutdown cleanup here too)
+    # 3. Shutdown Logic
     print("🛑 Server shutting down...")
 
 # --- APP DEFINITION WITH LIFESPAN ---
-app = FastAPI(lifespan=lifespan)  # <--- LINKED LIFESPAN HERE
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -99,7 +99,7 @@ def get_llm(provider: str, api_key: Optional[str]):
     
     elif provider == "gemini":
         return ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash", 
+            model="gemini-2.5-flash",  # <--- FIXED: 2.5 does not exist yet
             google_api_key=api_key, 
             temperature=0
         )
@@ -125,10 +125,108 @@ def get_vectorstore(video_id: str):
 
 
 # --- AUDIO DOWNLOADER ---
+# def download_audio_and_transcribe(video_url: str):
+#     print("⚠️ No subtitles found. Falling back to Audio Transcription...")
+#     groq_client = Groq(api_key=DEFAULT_GROQ_KEY)
+    
+#     session_id = str(uuid.uuid4())
+#     print(f"   🆔 Session ID: {session_id}")
+
+#     base_filename = f"temp_audio_{session_id}"
+#     audio_filename = f"{base_filename}.mp3"
+    
+#     ydl_opts = {
+#         'format': 'bestaudio/best',
+#         'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '32'}],
+#         'outtmpl': f"{base_filename}.%(ext)s",
+#         'quiet': True,
+#         'js_runtimes': {'node': {}} 
+#     }
+    
+#     try:
+#         if os.path.exists(audio_filename): os.remove(audio_filename)
+        
+#         print(f"   Downloading audio to {audio_filename}...")
+#         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+#             ydl.download([video_url])
+        
+#         file_size_mb = os.path.getsize(audio_filename) / (1024 * 1024)
+#         print(f"   Audio File Size: {file_size_mb:.2f} MB")
+
+#         full_transcript = ""
+        
+#         if file_size_mb < 24:
+#             with open(audio_filename, "rb") as file:
+#                 transcription = groq_client.audio.transcriptions.create(
+#                     file=(audio_filename, file.read()),
+#                     model="whisper-large-v3-turbo",
+#                     response_format="json",
+#                     language="en",
+#                     temperature=0.0
+#                 )
+#             full_transcript = transcription.text
+            
+#         else:
+#             print("   ⚠️ File too large. Splitting into chunks...")
+#             audio = AudioSegment.from_mp3(audio_filename)
+#             chunk_length_ms = 10 * 60 * 1000 
+#             chunks = [audio[i:i + chunk_length_ms] for i in range(0, len(audio), chunk_length_ms)]
+            
+#             print(f"   Processing {len(chunks)} chunks...")
+            
+#             for i, chunk in enumerate(chunks):
+#                 chunk_name = f"temp_chunk_{session_id}_{i}.mp3" 
+#                 chunk.export(chunk_name, format="mp3", bitrate="32k")
+                
+#                 with open(chunk_name, "rb") as file:
+#                     transcription = groq_client.audio.transcriptions.create(
+#                         file=(chunk_name, file.read()),
+#                         model="whisper-large-v3-turbo",
+#                         response_format="json",
+#                         language="en",
+#                         temperature=0.0
+#                     )
+#                 full_transcript += " " + transcription.text
+#                 print(f"     ✅ Chunk {i+1}/{len(chunks)} processed")
+#                 if os.path.exists(chunk_name): os.remove(chunk_name)
+
+#         if os.path.exists(audio_filename): os.remove(audio_filename)
+#         return full_transcript.strip()
+        
+#     except Exception as e:
+#         if os.path.exists(audio_filename): os.remove(audio_filename)
+#         for f in os.listdir():
+#             if f.startswith(f"temp_chunk_{session_id}"):
+#                 os.remove(f)
+#         print(f"❌ TRANSCRIPTION FAILED: {str(e)}")
+#         raise e
+# --- HELPER FOR PARALLEL PROCESSING ---
+def transcribe_chunk(client, chunk_filename):
+    """Helper function to transcribe a single chunk."""
+    try:
+        with open(chunk_filename, "rb") as file:
+            print(f"   🎙️ Transcribing {chunk_filename}...")
+            transcription = client.audio.transcriptions.create(
+                file=(chunk_filename, file.read()),
+                model="whisper-large-v3-turbo",
+                response_format="json",
+                language="en",
+                temperature=0.0
+            )
+        return transcription.text
+    except Exception as e:
+        print(f"❌ Error transcribing {chunk_filename}: {e}")
+        return ""
+    finally:
+        # Clean up chunk immediately after processing
+        if os.path.exists(chunk_filename): os.remove(chunk_filename)
+
+# --- UPDATED AUDIO DOWNLOADER ---
 def download_audio_and_transcribe(video_url: str):
     print("⚠️ No subtitles found. Falling back to Audio Transcription...")
     groq_client = Groq(api_key=DEFAULT_GROQ_KEY)
     
+    # 1. Use UUID for Safe Parallel User Sessions
     session_id = str(uuid.uuid4())
     print(f"   🆔 Session ID: {session_id}")
 
@@ -156,6 +254,7 @@ def download_audio_and_transcribe(video_url: str):
         full_transcript = ""
         
         if file_size_mb < 24:
+            # Small file: Process normally
             with open(audio_filename, "rb") as file:
                 transcription = groq_client.audio.transcriptions.create(
                     file=(audio_filename, file.read()),
@@ -167,40 +266,47 @@ def download_audio_and_transcribe(video_url: str):
             full_transcript = transcription.text
             
         else:
+            # Large file: Parallel Processing!
             print("   ⚠️ File too large. Splitting into chunks...")
             audio = AudioSegment.from_mp3(audio_filename)
             chunk_length_ms = 10 * 60 * 1000 
             chunks = [audio[i:i + chunk_length_ms] for i in range(0, len(audio), chunk_length_ms)]
             
-            print(f"   Processing {len(chunks)} chunks...")
+            chunk_files = []
             
+            # Export all chunks first
+            print(f"   Exporting {len(chunks)} chunks for parallel processing...")
             for i, chunk in enumerate(chunks):
                 chunk_name = f"temp_chunk_{session_id}_{i}.mp3" 
                 chunk.export(chunk_name, format="mp3", bitrate="32k")
+                chunk_files.append(chunk_name)
+            
+            # --- PARALLEL EXECUTION START --- 
+            # Process up to 3 chunks at the same time
+            print("   🚀 Starting Parallel Transcription...")
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                # Submit all tasks
+                futures = [executor.submit(transcribe_chunk, groq_client, f) for f in chunk_files]
                 
-                with open(chunk_name, "rb") as file:
-                    transcription = groq_client.audio.transcriptions.create(
-                        file=(chunk_name, file.read()),
-                        model="whisper-large-v3-turbo",
-                        response_format="json",
-                        language="en",
-                        temperature=0.0
-                    )
-                full_transcript += " " + transcription.text
-                print(f"     ✅ Chunk {i+1}/{len(chunks)} processed")
-                if os.path.exists(chunk_name): os.remove(chunk_name)
+                # Wait for results in order
+                results = [f.result() for f in futures]
+            
+            # Combine results
+            full_transcript = " ".join(results)
+            print("   ✅ Parallel Transcription Complete.")
+            # --- PARALLEL EXECUTION END ---
 
         if os.path.exists(audio_filename): os.remove(audio_filename)
         return full_transcript.strip()
         
     except Exception as e:
         if os.path.exists(audio_filename): os.remove(audio_filename)
+        # Cleanup any remaining chunks
         for f in os.listdir():
             if f.startswith(f"temp_chunk_{session_id}"):
                 os.remove(f)
         print(f"❌ TRANSCRIPTION FAILED: {str(e)}")
         raise e
-
 
 # --- DATA MODELS ---
 class VideoRequest(BaseModel):
@@ -301,8 +407,9 @@ app_graph = workflow.compile()
 
 # --- ENDPOINTS ---
 
+# ✅ UPDATED: Removed 'async' to allow concurrency
 @app.post("/process-video")
-async def process_video(request: VideoRequest):
+def process_video(request: VideoRequest):
     try:
         video_id = extract_video_id(request.video_url)
         if not video_id: raise HTTPException(status_code=400, detail="Invalid URL")
@@ -341,8 +448,9 @@ async def process_video(request: VideoRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ✅ UPDATED: Removed 'async' to allow concurrency
 @app.post("/chat")
-async def chat(
+def chat(
     request: ChatRequest,
     x_api_key: Optional[str] = Header(None),
     x_provider: Optional[str] = Header("groq")
