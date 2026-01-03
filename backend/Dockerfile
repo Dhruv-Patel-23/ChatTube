@@ -1,5 +1,5 @@
 # ✅ MATCH YOUR LOCAL VERSION (3.12)
-FROM python:3.12.12
+FROM python:3.12-slim
 
 # 1. Install system dependencies
 # FFmpeg is required for audio splitting
